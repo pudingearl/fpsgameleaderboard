@@ -1,6 +1,6 @@
-# Privacy Policy for fpsshooter 
+# Privacy Policy for CYBERLOOP 2077 
 
-**Game:** fpsshooter  
+**Game:** CYBERLOOP 2077  
 **Last updated:** 2026-11-06  
 **Contact:** pudingearl@gmail.com
 ---
