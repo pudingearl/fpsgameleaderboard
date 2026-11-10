@@ -1,7 +1,7 @@
 # Privacy Policy for CYBERLOOP 2077 
 
 **Game:** CYBERLOOP 2077  
-**Last updated:** 2026-11-06  
+**Last updated:** 2026-11-10  
 **Contact:** pudingearl@gmail.com
 ---
 
