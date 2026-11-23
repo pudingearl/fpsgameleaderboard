@@ -1,9 +1,9 @@
 // ============================================================
-// Run Game Leaderboard API v1.0
+// Run Game Leaderboard API v1.1
 // Node.js + Express + MongoDB
 //
 //  - Oyuncu başına TEK doküman (anonim, rastgele playerID). Yeni skor sadece daha yüksekse üzerine yazılır.
-//  - Skor leaderboard'u: en iyi 10 skor.
+//  - Skor leaderboard'u: en iyi 10 skor + oyuncunun çevresi (around) + toplam oyuncu sayısı (total).
 //  - Süre leaderboard'u (oyun içi): en iyi süreler (oyuncunun en uzun run süresi, skordan bağımsız).
 //  - İsim YOK. IP / user-agent veritabanına YAZILMAZ.
 // ============================================================
@@ -52,6 +52,9 @@ const RULES = {
   maxHitsPerSecond:  4,
 };
 
+// Oyuncunun çevresinde en fazla kaç kayıt (üst + alt ayrı ayrı) döndürülür.
+const MAX_AROUND = 25;
+
 // Replay koruması: imza 10 dk hatırlanır (zaman penceresi ±5 dk)
 const TIMESTAMP_TOLERANCE_S = 300;
 const SIGNATURE_MEMORY_MS   = 10 * 60_000;
@@ -75,6 +78,7 @@ async function initDatabase() {
 
   await scores.createIndex({ playerID: 1 }, { unique: true });
   await scores.createIndex({ flagged: 1, score: -1 });
+  await scores.createIndex({ flagged: 1, score: -1, lastUpdate: 1 }); // sıralama + around sorguları
   await scores.createIndex({ flagged: 1, bestTimeMs: -1 });
 
   await logs.createIndex({ createdAt: 1 }, { expireAfterSeconds: 3 * 24 * 60 * 60 });
@@ -149,10 +153,13 @@ let topScoresCache = { data: null, ts: 0 };
 let topTimesCache  = { data: null, ts: 0 };
 const invalidateCaches = () => { topScoresCache = { data: null, ts: 0 }; topTimesCache = { data: null, ts: 0 }; };
 
+// Sıralama ölçütü her yerde aynı: skor azalan, eşitlikte önce kaydeden üstte.
+const VALID = { flagged: false, score: { $gte: 0 } };
+
 async function getTopScores() {
   if (topScoresCache.data && Date.now() - topScoresCache.ts < CACHE_TTL_MS) return topScoresCache.data;
   const data = await scores
-    .find({ flagged: false, score: { $gte: 0 } })
+    .find(VALID)
     .sort({ score: -1, lastUpdate: 1 })
     .limit(10)
     .project(ENTRY_PROJECTION)
@@ -173,6 +180,17 @@ async function getTopTimes() {
   topTimesCache = { data, ts: Date.now() };
   return data;
 }
+
+// "doc'tan ÖNCE gelenler" ve "doc'tan SONRA gelenler" filtreleri (top listesiyle aynı sıralama: score desc, lastUpdate asc).
+const beforeFilter = (doc) => ({
+  flagged: false,
+  $or: [{ score: { $gt: doc.score } }, { score: doc.score, lastUpdate: { $lt: doc.lastUpdate } }],
+});
+const afterFilter = (doc) => ({
+  flagged: false,
+  score: { $gte: 0 },
+  $or: [{ score: { $lt: doc.score } }, { score: doc.score, lastUpdate: { $gt: doc.lastUpdate } }],
+});
 
 // ---- APP ----
 
@@ -302,7 +320,7 @@ app.post("/api/score", scoreLimiter, verifySignature, async (req, res) => {
     const doc = await scores.findOne({ playerID: id });
     let rank = 9999;
     if (doc && !doc.flagged) {
-      rank = (await scores.countDocuments({ flagged: false, score: { $gt: doc.score } })) + 1;
+      rank = (await scores.countDocuments(beforeFilter(doc))) + 1;
     }
     return res.json({ ok: true, improved: upd.modifiedCount > 0, rank });
   } catch (err) {
@@ -311,21 +329,42 @@ app.post("/api/score", scoreLimiter, verifySignature, async (req, res) => {
   }
 });
 
-// GET /api/leaderboard?playerID=...   -> en iyi 10 skor + oyuncunun kendi sırası
+// GET /api/leaderboard?playerID=...&around=12
+//   -> top (en iyi 10), me (oyuncunun kaydı + sırası), myRank, total (geçerli oyuncu sayısı)
+//   -> around: oyuncunun üstündeki ve altındaki en yakın 'around' kayıt (oyuncunun kendisi hariç, rank'lar kesin sıradır)
+// Rank = "kaç kişi benden önce" + 1 (top listesindeki sıralamayla birebir aynı, eşit skorlarda da benzersiz).
 app.get("/api/leaderboard", async (req, res) => {
   try {
     const id = cleanId(req.query.playerID);
+    const aroundN = Math.min(MAX_AROUND, Math.max(0, parseInt(req.query.around, 10) || 0));
+
     const top = (await getTopScores()).map((d, i) => toEntry(d, i + 1, id && d.playerID === id));
+    const total = await scores.countDocuments(VALID);
 
     let me = EMPTY_ENTRY, myRank = 0;
+    const around = [];
+
     if (id) {
       const doc = await scores.findOne({ playerID: id, flagged: false, score: { $gte: 0 } });
       if (doc) {
-        myRank = (await scores.countDocuments({ flagged: false, score: { $gt: doc.score } })) + 1;
+        myRank = (await scores.countDocuments(beforeFilter(doc))) + 1;
         me = toEntry(doc, myRank, true);
+
+        if (aroundN > 0) {
+          const [above, below] = await Promise.all([
+            // doc'a EN YAKIN olanlar önce: score artan, lastUpdate azalan
+            scores.find(beforeFilter(doc)).sort({ score: 1, lastUpdate: -1 }).limit(aroundN).project(ENTRY_PROJECTION).toArray(),
+            scores.find(afterFilter(doc)).sort({ score: -1, lastUpdate: 1 }).limit(aroundN).project(ENTRY_PROJECTION).toArray(),
+          ]);
+
+          above.forEach((d, i) => around.push(toEntry(d, myRank - 1 - i, false)));
+          below.forEach((d, i) => around.push(toEntry(d, myRank + 1 + i, false)));
+          around.sort((a, b) => a.rank - b.rank);
+        }
       }
     }
-    return res.json({ top, me, myRank });
+
+    return res.json({ top, me, myRank, around, total });
   } catch (err) {
     console.error("[leaderboard] error:", err);
     return res.status(500).json({ error: "Server error" });
