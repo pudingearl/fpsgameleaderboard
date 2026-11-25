@@ -1,10 +1,11 @@
 // ============================================================
-// Run Game Leaderboard API v1.1
+// Run Game Leaderboard API v1.2  (RUN BAŞINA sıralama)
 // Node.js + Express + MongoDB
 //
-//  - Oyuncu başına TEK doküman (anonim, rastgele playerID). Yeni skor sadece daha yüksekse üzerine yazılır.
-//  - Skor leaderboard'u: en iyi 10 skor + oyuncunun çevresi (around) + toplam oyuncu sayısı (total).
-//  - Süre leaderboard'u (oyun içi): en iyi süreler (oyuncunun en uzun run süresi, skordan bağımsız).
+//  - Her run ayrı bir kayıttır (Runs). Sıralama oyuncunun en iyisine DEĞİL, her run'ın kendi skoruna göredir.
+//  - "Devam et"ten sonra aynı run tekrar gönderilirse (continued) yeni kayıt açılmaz, aynı run güncellenir.
+//  - RunScores: oyuncu başına özet (en iyi süre, flagged). Süre tablosu buradan beslenir.
+//  - Skor leaderboard'u: en iyi 10 run + oyuncunun SON run'ının sırası + çevresi (around) + toplam run sayısı (total).
 //  - İsim YOK. IP / user-agent veritabanına YAZILMAZ.
 // ============================================================
 
@@ -55,6 +56,13 @@ const RULES = {
 // Oyuncunun çevresinde en fazla kaç kayıt (üst + alt ayrı ayrı) döndürülür.
 const MAX_AROUND = 25;
 
+// "Benim run'ım" sayılması için son güncellemenin en fazla ne kadar eski olabileceği.
+// (Skor gönderimi başarısız olduysa eski bir run'ın sırası yanlışlıkla gösterilmesin.)
+const RECENT_RUN_MS = 10 * 60_000;
+// "Devam et" ile aynı run'ın tekrar gönderilmesi / ağ yeniden denemesi için pencere.
+const SAME_RUN_WINDOW_MS = 2 * 3600_000;
+const RETRY_DEDUPE_MS = 2 * 60_000;
+
 // Replay koruması: imza 10 dk hatırlanır (zaman penceresi ±5 dk)
 const TIMESTAMP_TOLERANCE_S = 300;
 const SIGNATURE_MEMORY_MS   = 10 * 60_000;
@@ -67,23 +75,47 @@ setInterval(() => {
 // ---- DATABASE ----
 
 const client = new MongoClient(MONGO_URI, { serverSelectionTimeoutMS: 5000, connectTimeoutMS: 10000 });
-let scores, logs, counts;
+let scores, runs, logs, counts;
 
 async function initDatabase() {
   await client.connect();
   const db = client.db(DB_NAME);
-  scores = db.collection("RunScores");
+  scores = db.collection("RunScores"); // oyuncu özeti (bestTimeMs, flagged)
+  runs   = db.collection("Runs");      // her run ayrı kayıt
   logs   = db.collection("RequestLogs");
   counts = db.collection("RequestCounts");
 
   await scores.createIndex({ playerID: 1 }, { unique: true });
-  await scores.createIndex({ flagged: 1, score: -1 });
-  await scores.createIndex({ flagged: 1, score: -1, lastUpdate: 1 }); // sıralama + around sorguları
   await scores.createIndex({ flagged: 1, bestTimeMs: -1 });
+
+  await runs.createIndex({ flagged: 1, score: -1, createdAt: 1 }); // sıralama + around sorguları
+  await runs.createIndex({ playerID: 1, lastUpdate: -1 });
 
   await logs.createIndex({ createdAt: 1 }, { expireAfterSeconds: 3 * 24 * 60 * 60 });
   await logs.createIndex({ type: 1, playerID: 1, createdAt: -1 });
   await counts.createIndex({ endpoint: 1 }, { unique: true });
+
+  // Tek seferlik geçiş: eski "oyuncu başına en iyi skor" kayıtları ilk run'lar olarak taşınır.
+  if ((await runs.countDocuments({}, { limit: 1 })) === 0) {
+    const old = await scores.find({ score: { $gte: 0 } }).toArray();
+    if (old.length > 0) {
+      await runs.insertMany(old.map((d) => ({
+        playerID: d.playerID,
+        score: d.score,
+        timeMs: d.timeMs || 0,
+        kills: d.kills || 0,
+        accuracy: d.accuracy || 0,
+        hitsTaken: d.hitsTaken || 0,
+        levelsPassed: d.levelsPassed || 0,
+        continued: !!d.continued,
+        flagged: !!d.flagged,
+        createdAt: d.lastUpdate || d.createdAt || new Date(),
+        lastUpdate: new Date(0), // eski kayıtlar "benim son run'ım" sayılmasın
+      })), { ordered: false });
+      console.log(`Migrated ${old.length} legacy scores into Runs.`);
+    }
+  }
+
   console.log("Database ready.");
 }
 
@@ -92,7 +124,8 @@ async function initDatabase() {
 const ID_RE = /^[\w-]{8,64}$/;
 const cleanId = (v) => (typeof v === "string" && ID_RE.test(v) ? v : null);
 
-const ENTRY_PROJECTION = { _id: 0, playerID: 1, score: 1, timeMs: 1, kills: 1, accuracy: 1, hitsTaken: 1, levelsPassed: 1, continued: 1 };
+// _id dahil (hangi satırın "benim run'ım" olduğunu bulmak için). Dışarı verilmez.
+const ENTRY_PROJECTION = { playerID: 1, score: 1, timeMs: 1, kills: 1, accuracy: 1, hitsTaken: 1, levelsPassed: 1, continued: 1, createdAt: 1 };
 
 function toEntry(doc, rank, isYou) {
   return {
@@ -143,8 +176,28 @@ async function handleSuspicious(playerID, violations) {
   const recent = await logs.countDocuments({
     type: "suspicious_score", playerID, createdAt: { $gt: new Date(Date.now() - 10 * 60_000) },
   });
-  if (recent >= 3) await scores.updateMany({ playerID }, { $set: { flagged: true } });
+  if (recent >= 3) {
+    await scores.updateMany({ playerID }, { $set: { flagged: true } });
+    await runs.updateMany({ playerID }, { $set: { flagged: true } });
+  }
 }
+
+// ---- SIRALAMA ----
+// Her yerde AYNI ölçüt: skor azalan, eşitlikte önce oluşturulan üstte (createdAt artan).
+// Rank = "benden önce gelen run sayısı" + 1: top listesiyle, around ile ve me ile birebir tutarlıdır.
+
+const VALID = { flagged: false, score: { $gte: 0 } };
+
+const beforeFilter = (doc) => ({
+  ...VALID,
+  $or: [{ score: { $gt: doc.score } }, { score: doc.score, createdAt: { $lt: doc.createdAt } }],
+});
+const afterFilter = (doc) => ({
+  ...VALID,
+  $or: [{ score: { $lt: doc.score } }, { score: doc.score, createdAt: { $gt: doc.createdAt } }],
+});
+
+const rankOf = async (doc) => (await runs.countDocuments(beforeFilter(doc))) + 1;
 
 // ---- ÖNBELLEK (30 sn) ----
 
@@ -153,14 +206,11 @@ let topScoresCache = { data: null, ts: 0 };
 let topTimesCache  = { data: null, ts: 0 };
 const invalidateCaches = () => { topScoresCache = { data: null, ts: 0 }; topTimesCache = { data: null, ts: 0 }; };
 
-// Sıralama ölçütü her yerde aynı: skor azalan, eşitlikte önce kaydeden üstte.
-const VALID = { flagged: false, score: { $gte: 0 } };
-
 async function getTopScores() {
   if (topScoresCache.data && Date.now() - topScoresCache.ts < CACHE_TTL_MS) return topScoresCache.data;
-  const data = await scores
+  const data = await runs
     .find(VALID)
-    .sort({ score: -1, lastUpdate: 1 })
+    .sort({ score: -1, createdAt: 1 })
     .limit(10)
     .project(ENTRY_PROJECTION)
     .toArray();
@@ -168,7 +218,7 @@ async function getTopScores() {
   return data;
 }
 
-// Oyuncu kendi kaydını listeden çıkarabilsin diye 11 kayıt tutulur.
+// Oyuncu kendi kaydını listeden çıkarabilsin diye 11 kayıt tutulur. (Süre tablosu oyuncu başına en iyi süredir.)
 async function getTopTimes() {
   if (topTimesCache.data && Date.now() - topTimesCache.ts < CACHE_TTL_MS) return topTimesCache.data;
   const data = await scores
@@ -180,17 +230,6 @@ async function getTopTimes() {
   topTimesCache = { data, ts: Date.now() };
   return data;
 }
-
-// "doc'tan ÖNCE gelenler" ve "doc'tan SONRA gelenler" filtreleri (top listesiyle aynı sıralama: score desc, lastUpdate asc).
-const beforeFilter = (doc) => ({
-  flagged: false,
-  $or: [{ score: { $gt: doc.score } }, { score: doc.score, lastUpdate: { $lt: doc.lastUpdate } }],
-});
-const afterFilter = (doc) => ({
-  flagged: false,
-  score: { $gte: 0 },
-  $or: [{ score: { $lt: doc.score } }, { score: doc.score, lastUpdate: { $gt: doc.lastUpdate } }],
-});
 
 // ---- APP ----
 
@@ -275,6 +314,9 @@ function verifySignature(req, res, next) {
 // ---- ENDPOINTLER ----
 
 // POST /api/score
+// Her run ayrı kayıt olarak eklenir. İstisnalar:
+//  - Aynı run'ın ağ yeniden denemesi (birebir aynı değerler, 2 dk içinde): yeni kayıt açılmaz.
+//  - "Devam et"ten sonraki ikinci ölüm (continued=true; süre / bölüm / skor önceki kayıttan düşük değil): aynı run güncellenir.
 app.post("/api/score", scoreLimiter, verifySignature, async (req, res) => {
   try {
     const id = req.playerID;
@@ -292,37 +334,71 @@ app.post("/api/score", scoreLimiter, verifySignature, async (req, res) => {
 
     const now = new Date();
 
-    // 1) Kayıt yoksa boş bir kayıt aç (unique index yarışı güvenle çözer)
+    // Oyuncu özeti (en iyi süre, flagged). Kişisel rekor kontrolü için önceki en iyi skor.
+    const prev = await scores.findOne({ playerID: id }, { projection: { score: 1 } });
+    const prevBest = prev && typeof prev.score === "number" ? prev.score : -1;
+
     await scores.updateOne(
       { playerID: id },
-      { $setOnInsert: {
-          score: -1, timeMs: 0, kills: 0, accuracy: 0, hitsTaken: 0, levelsPassed: 0,
-          continued: false, bestTimeMs: 0, flagged: false, createdAt: now, lastUpdate: now,
-      } },
+      {
+        $setOnInsert: { flagged: false, createdAt: now },
+        $max: { bestTimeMs: run.timeMs, score: run.score },
+        $set: { lastUpdate: now },
+      },
       { upsert: true }
     );
 
-    // 2) Skor sadece DAHA YÜKSEKSE üzerine yazılır
-    const upd = await scores.updateOne(
-      { playerID: id, score: { $lt: run.score } },
-      { $set: {
-          score: run.score, timeMs: run.timeMs, kills: run.kills, accuracy: run.accuracy,
-          hitsTaken: run.hitsTaken, levelsPassed: run.levelsPassed, continued: run.continued,
-          lastUpdate: now,
-      } }
-    );
+    const fields = {
+      playerID: id,
+      score: run.score,
+      timeMs: run.timeMs,
+      kills: run.kills,
+      accuracy: run.accuracy,
+      hitsTaken: run.hitsTaken,
+      levelsPassed: run.levelsPassed,
+      continued: run.continued,
+      flagged: false,
+      lastUpdate: now,
+    };
 
-    // 3) En iyi süre skordan bağımsız (süre leaderboard'u için)
-    await scores.updateOne({ playerID: id }, { $max: { bestTimeMs: run.timeMs } });
+    let runId = null;
+
+    // 1) Ağ yeniden denemesi: birebir aynı run zaten kayıtlı mı?
+    const dup = await runs.findOne({
+      playerID: id, score: run.score, timeMs: run.timeMs, kills: run.kills, hitsTaken: run.hitsTaken,
+      levelsPassed: run.levelsPassed, accuracy: run.accuracy, continued: run.continued,
+      lastUpdate: { $gt: new Date(Date.now() - RETRY_DEDUPE_MS) },
+    });
+    if (dup) {
+      await runs.updateOne({ _id: dup._id }, { $set: { lastUpdate: now } });
+      runId = dup._id;
+    }
+
+    // 2) "Devam et": aynı run'ın ilerlemiş hali, önceki kaydı günceller.
+    if (!runId && run.continued) {
+      const latest = await runs.findOne({ playerID: id, flagged: false }, { sort: { lastUpdate: -1 } });
+      const sameRun = latest
+        && Date.now() - latest.lastUpdate.getTime() < SAME_RUN_WINDOW_MS
+        && run.timeMs >= latest.timeMs
+        && run.levelsPassed >= latest.levelsPassed
+        && run.score >= latest.score;
+      if (sameRun) {
+        await runs.updateOne({ _id: latest._id }, { $set: fields });
+        runId = latest._id;
+      }
+    }
+
+    // 3) Yeni run
+    if (!runId) {
+      const r = await runs.insertOne({ ...fields, createdAt: now });
+      runId = r.insertedId;
+    }
 
     invalidateCaches();
 
-    const doc = await scores.findOne({ playerID: id });
-    let rank = 9999;
-    if (doc && !doc.flagged) {
-      rank = (await scores.countDocuments(beforeFilter(doc))) + 1;
-    }
-    return res.json({ ok: true, improved: upd.modifiedCount > 0, rank });
+    const doc = await runs.findOne({ _id: runId });
+    const rank = doc ? await rankOf(doc) : 9999;
+    return res.json({ ok: true, improved: run.score > prevBest, rank });
   } catch (err) {
     console.error("[score] error:", err);
     return res.status(500).json({ error: "Server error" });
@@ -330,37 +406,42 @@ app.post("/api/score", scoreLimiter, verifySignature, async (req, res) => {
 });
 
 // GET /api/leaderboard?playerID=...&around=12
-//   -> top (en iyi 10), me (oyuncunun kaydı + sırası), myRank, total (geçerli oyuncu sayısı)
-//   -> around: oyuncunun üstündeki ve altındaki en yakın 'around' kayıt (oyuncunun kendisi hariç, rank'lar kesin sıradır)
-// Rank = "kaç kişi benden önce" + 1 (top listesindeki sıralamayla birebir aynı, eşit skorlarda da benzersiz).
+//   -> top: en iyi 10 RUN (aynı oyuncu birden çok kez bulunabilir)
+//   -> me: oyuncunun SON run'ı ve sırası (son 10 dk içinde gönderilmediyse boş: rank 0)
+//   -> around: me'nin üstündeki ve altındaki en yakın 'around' run (me hariç), rank'lar kesin sıradır
+//   -> total: geçerli toplam run sayısı
 app.get("/api/leaderboard", async (req, res) => {
   try {
     const id = cleanId(req.query.playerID);
     const aroundN = Math.min(MAX_AROUND, Math.max(0, parseInt(req.query.around, 10) || 0));
 
-    const top = (await getTopScores()).map((d, i) => toEntry(d, i + 1, id && d.playerID === id));
-    const total = await scores.countDocuments(VALID);
+    let myRun = null;
+    if (id) {
+      const d = await runs.findOne({ playerID: id, ...VALID }, { sort: { lastUpdate: -1 } });
+      if (d && Date.now() - d.lastUpdate.getTime() < RECENT_RUN_MS) myRun = d;
+    }
+    const myId = myRun ? String(myRun._id) : null;
+
+    const top = (await getTopScores()).map((d, i) => toEntry(d, i + 1, myId && String(d._id) === myId));
+    const total = await runs.countDocuments(VALID);
 
     let me = EMPTY_ENTRY, myRank = 0;
     const around = [];
 
-    if (id) {
-      const doc = await scores.findOne({ playerID: id, flagged: false, score: { $gte: 0 } });
-      if (doc) {
-        myRank = (await scores.countDocuments(beforeFilter(doc))) + 1;
-        me = toEntry(doc, myRank, true);
+    if (myRun) {
+      myRank = await rankOf(myRun);
+      me = toEntry(myRun, myRank, true);
 
-        if (aroundN > 0) {
-          const [above, below] = await Promise.all([
-            // doc'a EN YAKIN olanlar önce: score artan, lastUpdate azalan
-            scores.find(beforeFilter(doc)).sort({ score: 1, lastUpdate: -1 }).limit(aroundN).project(ENTRY_PROJECTION).toArray(),
-            scores.find(afterFilter(doc)).sort({ score: -1, lastUpdate: 1 }).limit(aroundN).project(ENTRY_PROJECTION).toArray(),
-          ]);
+      if (aroundN > 0) {
+        const [above, below] = await Promise.all([
+          // me'ye EN YAKIN olanlar önce: score artan, createdAt azalan
+          runs.find(beforeFilter(myRun)).sort({ score: 1, createdAt: -1 }).limit(aroundN).project(ENTRY_PROJECTION).toArray(),
+          runs.find(afterFilter(myRun)).sort({ score: -1, createdAt: 1 }).limit(aroundN).project(ENTRY_PROJECTION).toArray(),
+        ]);
 
-          above.forEach((d, i) => around.push(toEntry(d, myRank - 1 - i, false)));
-          below.forEach((d, i) => around.push(toEntry(d, myRank + 1 + i, false)));
-          around.sort((a, b) => a.rank - b.rank);
-        }
+        above.forEach((d, i) => around.push(toEntry(d, myRank - 1 - i, false)));
+        below.forEach((d, i) => around.push(toEntry(d, myRank + 1 + i, false)));
+        around.sort((a, b) => a.rank - b.rank);
       }
     }
 
@@ -412,9 +493,10 @@ app.delete("/admin/player/:playerID", async (req, res) => {
   if (!id) return res.status(400).json({ error: "Invalid playerID" });
   try {
     const r = await scores.deleteMany({ playerID: id });
+    const rr = await runs.deleteMany({ playerID: id });
     await logs.deleteMany({ playerID: id });
     invalidateCaches();
-    return res.json({ ok: true, deleted: r.deletedCount });
+    return res.json({ ok: true, deleted: r.deletedCount, deletedRuns: rr.deletedCount });
   } catch (err) {
     console.error("[admin/delete] error:", err);
     return res.status(500).json({ error: "Server error" });
